@@ -33,11 +33,12 @@ streamlit run app.py
      `RELIANCE INDUSTRIES LTD` and `500325` all resolve.
 3. Hit **🚀 Start scraping**. The KPI strip, both data tabs, the *Last Company*
    tab and the run log all refresh as results land, with a live rate and ETA.
-4. **Export.** Four plain CSVs (Public Shareholding, Foreign Ownership Limits,
-   Summary, Run Log) download straight off disk and work at any size. A
-   combined **Excel workbook** or **CSV bundle (.zip)** is built on demand —
-   deliberately not on every rerun, because rebuilding a big workbook each time
-   a widget changes made the app feel frozen.
+4. **Export.** One click on **⬇️ Download full Excel workbook** gets the entire
+   run — all five sheets (About, Summary, Public Shareholding, Foreign Ownership
+   Limits, Run Log) in a single `.xlsx`, with no row cap. The workbook is built
+   once when the run finishes, so the button is already live; later clicks and
+   reruns reuse it. Individual tables are also there as plain CSVs, plus a
+   `.zip` of all of them.
 
 ### Scale
 
@@ -86,9 +87,21 @@ Cloud mounts the repo read-only, so `./runs` cannot be created there. The app
 now probes for a writable location and falls back to the system temp directory;
 the export panel shows the path in use.
 
-**A run seems to hang after finishing.** Fixed. The workbook and zip used to be
-regenerated on every rerun — about 12 s per interaction at 50k rows, ~40 s at
-full-universe size. Both are now built only when you ask for them.
+**A run seems to hang after finishing / no full Excel export appears.** Fixed.
+Two separate causes. The workbook was regenerated on every rerun (~12 s per
+interaction at 50k rows), and the naive pandas-to-openpyxl path needed about
+**1.8 GB** of memory for a full-universe run — over Streamlit Cloud's ~1 GB
+limit, so the app was killed rather than producing a file. The workbook is now
+streamed row by row:
+
+| Approach | Time | Peak memory |
+|---|---|---|
+| pandas + openpyxl (old) | 42 s | 1,762 MB — OOM on Streamlit Cloud |
+| streamed openpyxl (now) | 27 s | **86 MB** |
+
+It is built once when the run ends and cached, so downloading is a single click
+and no row cap is needed. Tables larger than Excel's 1,048,576-row sheet limit
+are split across numbered sheets automatically.
 
 ## Notes
 

@@ -31,7 +31,7 @@ MANUAL_MODE = "✍️ Pick companies manually"
 for key, val in {"writer": None, "running": False, "done": False,
                  "quarter": "", "elapsed": 0.0, "last": None,
                  "interrupted": False, "xlsx": None, "zipb": None,
-                 "conn": None}.items():
+                 "conn": None, "xlsx_error": None}.items():
     st.session_state.setdefault(key, val)
 
 
@@ -40,7 +40,8 @@ def reset_run():
     if w is not None:
         w.close()
     st.session_state.update(writer=None, done=False, elapsed=0.0, last=None,
-                            interrupted=False, xlsx=None, zipb=None)
+                            interrupted=False, xlsx=None, zipb=None,
+                            xlsx_error=None)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -280,6 +281,31 @@ def paint_last(res):
             st.warning(res.message)
 
 
+def ensure_workbook():
+    """Build the complete workbook once, so downloading is a single click.
+
+    Streamed row by row, so a full-universe run peaks around 90 MB rather than
+    the ~1.8 GB the naive pandas-to-openpyxl path needed — which is what used to
+    get the app killed on Streamlit Cloud.
+    """
+    w = st.session_state.writer
+    if w is None or st.session_state.xlsx is not None:
+        return
+    if w.public_rows == 0 and w.foreign_rows == 0:
+        return
+    total = w.public_rows + w.foreign_rows + w.companies * 2
+    try:
+        with st.spinner(f"Building the Excel workbook — {total:,} rows across "
+                        f"5 sheets. This takes about "
+                        f"{max(total / 6500, 1):.0f}s for a full run."):
+            st.session_state.xlsx = w.excel_bytes()
+            st.session_state.xlsx_error = None
+    except (MemoryError, OSError, ValueError) as exc:
+        st.session_state.xlsx_error = (
+            f"Could not build the workbook ({type(exc).__name__}: {exc}). "
+            f"The CSV downloads below hold the same data.")
+
+
 def paint_download():
     w = st.session_state.writer
     if not w or (w.public_rows == 0 and w.foreign_rows == 0):
@@ -289,55 +315,51 @@ def paint_download():
         st.divider()
         st.markdown("#### ⬇️ Export")
 
-        st.caption("**CSV — one file per table.** Written straight from disk, so "
-                   "these work at any size.")
-        cols = st.columns(4)
-        for col, key in zip(cols, ("public", "foreign", "summary", "log")):
-            label = w.CSV_LABELS[key]
-            rows, size = w.row_count(key), w.csv_size(key)
-            col.download_button(
-                f"{label}  \n`{rows:,} rows · {size / 1_048_576:.1f} MB`",
-                data=w.csv_bytes(key),
-                file_name=f"BSE_{label.replace(' ', '_')}_{stamp}.csv",
-                mime="text/csv", use_container_width=True,
-                disabled=size == 0, key=f"csv_{key}")
-
-        st.caption("**Everything in one file.** Built on demand — a full-universe "
-                   "run is large, so it is not rebuilt on every click.")
-        c1, c2, c3 = st.columns([1, 1, 2])
-
-        big = w.public_rows > 250_000
-        if st.session_state.xlsx is None:
-            c1.button("🧮 Build Excel workbook", use_container_width=True,
-                      disabled=big, key="mk_xlsx",
-                      help="All five sheets in one .xlsx."
-                           + (" Disabled above 250k rows — use the CSVs."
-                              if big else ""),
-                      on_click=lambda: st.session_state.update(
-                          xlsx=w.excel_bytes()))
-        else:
+        rows = w.public_rows + w.foreign_rows
+        if st.session_state.xlsx is not None:
+            c1, c2 = st.columns([1, 2])
             c1.download_button(
-                "⬇️ Download Excel", data=st.session_state.xlsx,
+                "⬇️  Download full Excel workbook",
+                data=st.session_state.xlsx,
                 file_name=f"BSE_Shareholding_{stamp}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument."
                      "spreadsheetml.sheet",
                 type="primary", use_container_width=True, key="dl_xlsx")
-
-        if st.session_state.zipb is None:
-            c2.button("🗜️ Build CSV bundle", use_container_width=True,
-                      key="mk_zip", help="All tables zipped together.",
-                      on_click=lambda: st.session_state.update(
-                          zipb=w.zip_bytes()))
+            c2.caption(
+                f"Everything in one file — **About**, **Summary**, "
+                f"**Public Shareholding**, **Foreign Ownership Limits**, "
+                f"**Run Log**.  \n"
+                f"{w.companies:,} companies · {rows:,} data rows · "
+                f"{len(st.session_state.xlsx) / 1_048_576:.1f} MB")
+        elif st.session_state.xlsx_error:
+            st.error(st.session_state.xlsx_error)
         else:
-            c2.download_button(
-                "⬇️ Download .zip", data=st.session_state.zipb,
-                file_name=f"BSE_Shareholding_{stamp}.zip", mime="application/zip",
-                type="primary", use_container_width=True, key="dl_zip")
+            st.button("🧮 Build the Excel workbook", use_container_width=False,
+                      key="mk_xlsx", on_click=ensure_workbook)
 
-        c3.caption(f"Raw CSVs are already on disk at  \n`{w.dir}`")
-        if big:
-            c3.caption("⚠️ Over 250k rows — Excel is impractical at this size; "
-                       "use the CSVs.")
+        st.caption("Or take the tables individually as CSV — these stream "
+                   "straight off disk, so they work at any size.")
+        cols = st.columns(5)
+        for col, key in zip(cols, ("public", "foreign", "summary", "log")):
+            label = w.CSV_LABELS[key]
+            col.download_button(
+                f"{label}  \n`{w.row_count(key):,} rows`",
+                data=w.csv_bytes(key),
+                file_name=f"BSE_{label.replace(' ', '_')}_{stamp}.csv",
+                mime="text/csv", use_container_width=True,
+                disabled=w.csv_size(key) == 0, key=f"csv_{key}")
+        if st.session_state.zipb is None:
+            cols[4].button("🗜️ All as .zip", use_container_width=True,
+                           key="mk_zip",
+                           on_click=lambda: st.session_state.update(
+                               zipb=w.zip_bytes()))
+        else:
+            cols[4].download_button(
+                "⬇️ Download .zip", data=st.session_state.zipb,
+                file_name=f"BSE_Shareholding_{stamp}.zip",
+                mime="application/zip", use_container_width=True, key="dl_zip")
+
+        st.caption(f"Raw CSVs are already on disk at  `{w.dir}`")
 
 
 # ---------------------------------------------------------------- the scrape --
@@ -405,6 +427,7 @@ if start:
     elif writer.status_counts.get("ERROR"):
         st.warning(f"{writer.status_counts['ERROR']:,} companies failed on "
                    f"network errors — see the Run Log tab for the reasons.")
+    ensure_workbook()
     paint_download()
 
 elif st.session_state.done and st.session_state.writer is not None:
@@ -417,6 +440,7 @@ elif st.session_state.done and st.session_state.writer is not None:
         f"rows in {st.session_state.elapsed / 60:.1f} min")
     paint_tables(preview_rows)
     paint_last(st.session_state.last)
+    ensure_workbook()
     paint_download()
 
 else:

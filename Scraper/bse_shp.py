@@ -30,6 +30,7 @@ from datetime import date, datetime
 
 import requests
 from requests.adapters import HTTPAdapter
+from openpyxl.utils import get_column_letter
 from urllib3.util.retry import Retry
 
 API = "https://api.bseindia.com/BseIndiaAPI/api"
@@ -734,34 +735,90 @@ class RunWriter:
         return {"public": self.public_rows, "foreign": self.foreign_rows,
                 "summary": self.companies, "log": self.companies}.get(name, 0)
 
-    def excel_bytes(self, max_rows: int = 400_000) -> bytes:
-        """Multi-sheet .xlsx read back off the CSVs."""
-        import pandas as pd
+    # Excel's hard per-sheet limit; a table larger than this is split.
+    XL_MAX_ROWS = 1_048_576
+
+    @staticmethod
+    def _coerce(v: str):
+        """CSV text -> int / float / str, so Excel gets real numbers."""
+        if v == "" or v == "None":
+            return None
+        neg = v[1:] if v[:1] == "-" else v
+        if neg.isdigit():
+            try:
+                return int(v)
+            except ValueError:
+                return v
+        if neg.replace(".", "", 1).isdigit():
+            try:
+                return float(v)
+            except ValueError:
+                return v
+        return v
+
+    def _stream_sheet(self, wb, title: str, name: str) -> None:
+        """Append one CSV to the workbook a row at a time.
+
+        Streaming keeps peak memory flat: loading a full-universe run with
+        pandas and handing it to openpyxl's normal writer peaks around 1.8 GB,
+        which is over Streamlit Cloud's limit. This holds ~150 MB.
+        """
+        path = self.paths.get(name)
+        ws = wb.create_sheet(title[:31])
+        if not path or not os.path.exists(path):
+            ws.append(["no data"])
+            return
+
+        coerce = self._coerce
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.reader(fh)
+            try:
+                header = next(reader)
+            except StopIteration:
+                ws.append(["no data"])
+                return
+            for i, col in enumerate(header, start=1):
+                ws.column_dimensions[get_column_letter(i)].width = min(
+                    max(len(col) + 2, 12), 55)
+            ws.freeze_panes = "A2"
+            ws.append(header)
+
+            written, part = 1, 1
+            for row in reader:
+                if written >= self.XL_MAX_ROWS:
+                    part += 1
+                    ws = wb.create_sheet(f"{title[:26]} ({part})")
+                    ws.freeze_panes = "A2"
+                    ws.append(header)
+                    written = 1
+                ws.append([coerce(v) for v in row])
+                written += 1
+
+    def excel_bytes(self, max_rows: int | None = None) -> bytes:
+        """The whole run — every sheet — in one .xlsx.
+
+        `max_rows` is accepted for backwards compatibility and ignored; the
+        workbook always contains everything scraped.
+        """
+        import openpyxl
 
         self.flush()
+        wb = openpyxl.Workbook(write_only=True)
 
-        def read(name):
-            path = self.paths[name]
-            if not os.path.exists(path):
-                return pd.DataFrame({"Note": ["no data"]})
-            df = pd.read_csv(path, dtype={"Scrip Code": "Int64"},
-                             nrows=max_rows, low_memory=False)
-            return df if not df.empty else pd.DataFrame({"Note": ["no data"]})
+        ws = wb.create_sheet("About")
+        ws.column_dimensions["A"].width = 26
+        ws.column_dimensions["B"].width = 55
+        ws.append(["Field", "Value"])
+        for r in self.about_rows():
+            ws.append([r["Field"], str(r["Value"])])
+
+        for title, name in (("Summary", "summary"),
+                            ("Public Shareholding", "public"),
+                            ("Foreign Ownership Limits", "foreign"),
+                            ("Run Log", "log")):
+            self._stream_sheet(wb, title, name)
 
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as xl:
-            pd.DataFrame(self.about_rows()).to_excel(
-                xl, sheet_name="About", index=False)
-            read("summary").to_excel(xl, sheet_name="Summary", index=False)
-            read("public").to_excel(xl, sheet_name="Public Shareholding",
-                                    index=False)
-            read("foreign").to_excel(xl, sheet_name="Foreign Ownership Limits",
-                                     index=False)
-            read("log").to_excel(xl, sheet_name="Run Log", index=False)
-            for ws in xl.book.worksheets:
-                ws.freeze_panes = "A2"
-                for cells in ws.iter_cols(min_row=1, max_row=1):
-                    col = cells[0]
-                    width = max(len(str(col.value or "")) + 2, 12)
-                    ws.column_dimensions[col.column_letter].width = min(width, 55)
+        wb.save(buf)
+        wb.close()
         return buf.getvalue()
