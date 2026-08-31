@@ -612,14 +612,38 @@ class RunWriter:
     only counters plus a small rolling preview stay in memory.
     """
 
+    # The two files that matter carry the quarter in their name; the other two
+    # are small companions kept for traceability.
+    FILE_STEMS = {"public": "FreeFloatWShares",
+                  "foreign": "ForeignOwnershipLimits",
+                  "summary": "Summary",
+                  "log": "RunLog"}
+    DATA_FILES = ("public", "foreign")
+
+    @staticmethod
+    def _unique(path: str) -> str:
+        """Never overwrite a previous run's data."""
+        if not os.path.exists(path):
+            return path
+        stem, ext = os.path.splitext(path)
+        n = 2
+        while os.path.exists(f"{stem}_{n}{ext}"):
+            n += 1
+        return f"{stem}_{n}{ext}"
+
     def __init__(self, out_dir: str, quarter: str, qtrid: str,
-                 preview_cap: int = 600):
+                 preview_cap: int = 600, flush_every: int = 1):
         self.dir = out_dir
         os.makedirs(self.dir, exist_ok=True)
         self.quarter, self.qtrid = quarter, qtrid
         self.preview_cap = preview_cap
-        self.paths = {n: os.path.join(self.dir, f"{n}.csv")
-                      for n in ("public", "foreign", "log", "summary")}
+        # flush after every company by default, so a killed run loses nothing
+        self.flush_every = max(1, int(flush_every))
+
+        tag = (quarter or "").replace(" ", "")
+        self.paths = {
+            key: self._unique(os.path.join(self.dir, f"{stem}_{tag}.csv"))
+            for key, stem in self.FILE_STEMS.items()}
 
         self._fh, self._w = {}, {}
         for name, header in (("public", PUBLIC_HEADER), ("foreign", FOREIGN_HEADER),
@@ -627,6 +651,7 @@ class RunWriter:
             fh = open(self.paths[name], "w", newline="", encoding="utf-8-sig")
             w = csv.DictWriter(fh, fieldnames=header, extrasaction="ignore")
             w.writeheader()
+            fh.flush()
             self._fh[name], self._w[name] = fh, w
 
         self.companies = 0
@@ -664,7 +689,7 @@ class RunWriter:
         if res.foreign_rows:
             self.preview_foreign = (self.preview_foreign + res.foreign_rows)[-self.preview_cap:]
 
-        if self.companies % 20 == 0:
+        if self.companies % self.flush_every == 0:
             self.flush()
 
     def flush(self) -> None:
@@ -707,16 +732,26 @@ class RunWriter:
             aw.writeheader()
             aw.writerows(self.about_rows())
             z.writestr("00_about.csv", about.getvalue())
-            for label, name in (("01_summary", "summary"),
-                                ("02_public_shareholding", "public"),
-                                ("03_foreign_ownership_limits", "foreign"),
-                                ("04_run_log", "log")):
+            for name in ("public", "foreign", "summary", "log"):
                 if os.path.exists(self.paths[name]):
-                    z.write(self.paths[name], f"{label}.csv")
+                    z.write(self.paths[name], os.path.basename(self.paths[name]))
         return buf.getvalue()
 
-    CSV_LABELS = {"public": "Public Shareholding", "foreign": "Foreign Ownership Limits",
+    CSV_LABELS = {"public": "Public Shareholding (free float)",
+                  "foreign": "Foreign Ownership Limits",
                   "summary": "Summary", "log": "Run Log"}
+
+    def file_status(self, keys=None) -> list[dict]:
+        """Live view of what is on disk — used for the storage panel."""
+        self.flush()
+        out = []
+        for key in (keys or self.FILE_STEMS):
+            path = self.paths[key]
+            out.append({"key": key, "label": self.CSV_LABELS[key],
+                        "file": os.path.basename(path), "path": path,
+                        "rows": self.row_count(key),
+                        "bytes": self.csv_size(key)})
+        return out
 
     def csv_bytes(self, name: str) -> bytes:
         """One table, exactly as written, as a plain CSV download."""

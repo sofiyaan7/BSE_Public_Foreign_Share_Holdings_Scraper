@@ -144,6 +144,20 @@ else:
             except Exception as exc:  # noqa: BLE001 - shown to the user
                 st.sidebar.error(f"Could not read file: {exc}")
 
+st.sidebar.markdown("### 💾 Local storage")
+save_dir_in = st.sidebar.text_input(
+    "Folder for the CSV files", value=RUNS_DIR,
+    help="Rows are appended here as they are scraped, so nothing is held in "
+         "memory waiting for the run to finish.")
+save_dir = bse.pick_run_dir(save_dir_in.strip() or RUNS_DIR)
+if os.path.abspath(save_dir) != os.path.abspath(save_dir_in.strip() or RUNS_DIR):
+    st.sidebar.warning(f"That folder isn't writable — using `{save_dir}`")
+_tag = sel["label"].replace(" ", "")
+st.sidebar.caption(
+    "Two data files are written continuously:  \n"
+    f"`FreeFloatWShares_{_tag}.csv`  \n"
+    f"`ForeignOwnershipLimits_{_tag}.csv`")
+
 with st.sidebar.expander("⚙️ Options"):
     workers = st.slider("Parallel workers", 1, 16, 8,
                         help="8 gets through the full BSE list in roughly "
@@ -195,6 +209,7 @@ st.markdown(
 kpi_slot = st.empty()
 prog_slot = st.empty()
 now_slot = st.empty()
+files_slot = st.empty()
 
 tabs = st.tabs(["🧾 Public Shareholding", "🌍 Foreign Ownership Limits",
                 "🔎 Last Company", "📋 Run Log", "🌐 Universe"])
@@ -234,6 +249,23 @@ def paint_kpis(done_n, total_n):
                     f"{sc.get('ERROR', 0) + sc.get('NOT FOUND', 0) + sc.get('BLOCKED', 0):,}")
         c[4].metric("Public rows", f"{(w.public_rows if w else 0):,}")
         c[5].metric("Foreign rows", f"{(w.foreign_rows if w else 0):,}")
+
+
+def paint_files():
+    """Show the CSVs filling up on disk while the run is going."""
+    w = st.session_state.writer
+    if not w:
+        files_slot.empty()
+        return
+    rows = w.file_status()
+    with files_slot.container():
+        st.caption(f"💾 Writing continuously to `{w.dir}`")
+        cols = st.columns(len(rows))
+        for col, f in zip(cols, rows):
+            size = (f"{f['bytes'] / 1_048_576:.1f} MB" if f["bytes"] >= 1_048_576
+                    else f"{f['bytes'] / 1024:.0f} KB")
+            col.metric(f["file"], f"{f['rows']:,} rows", size,
+                       delta_color="off")
 
 
 def paint_tables(limit):
@@ -359,7 +391,8 @@ def paint_download():
                 file_name=f"BSE_Shareholding_{stamp}.zip",
                 mime="application/zip", use_container_width=True, key="dl_zip")
 
-        st.caption(f"Raw CSVs are already on disk at  `{w.dir}`")
+        st.caption(f"These same files are already saved on disk in  `{w.dir}` — "
+                   f"the downloads are just copies.")
 
 
 # ---------------------------------------------------------------- the scrape --
@@ -367,9 +400,7 @@ if start:
     reset_run()
     st.session_state.running = True
     st.session_state.quarter = sel["label"]
-    run_dir = os.path.join(
-        RUNS_DIR, f"{datetime.now():%Y%m%d_%H%M%S}_{sel['label'].replace(' ', '')}")
-    writer = bse.RunWriter(run_dir, sel["label"], sel["qtrid"])
+    writer = bse.RunWriter(save_dir, sel["label"], sel["qtrid"])
     st.session_state.writer = writer
 
     bar = prog_slot.progress(0.0, text="Starting workers…")
@@ -399,6 +430,7 @@ if start:
 
             if done % int(repaint_every) == 0 or done == n_targets:
                 paint_kpis(done, n_targets)
+                paint_files()
                 paint_tables(preview_rows)
                 paint_last(res)
     except Exception as exc:  # noqa: BLE001 - keep partial data usable
@@ -412,6 +444,7 @@ if start:
         st.session_state.elapsed = time.time() - t0
 
     paint_kpis(done, n_targets)
+    paint_files()
     paint_tables(preview_rows)
     paint_last(st.session_state.last)
     bar.progress(1.0, text=f"Finished {done:,} companies in "
@@ -438,6 +471,7 @@ elif st.session_state.done and st.session_state.writer is not None:
         f"Last run: **{w.companies:,} {noun}**, {st.session_state.quarter} — "
         f"{w.public_rows:,} public rows, {w.foreign_rows:,} foreign-ownership "
         f"rows in {st.session_state.elapsed / 60:.1f} min")
+    paint_files()
     paint_tables(preview_rows)
     paint_last(st.session_state.last)
     ensure_workbook()

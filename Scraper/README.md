@@ -40,6 +40,28 @@ streamlit run app.py
    reruns reuse it. Individual tables are also there as plain CSVs, plus a
    `.zip` of all of them.
 
+### Local storage
+
+Rows are appended to disk as each company completes — nothing waits in memory
+for the run to finish. Two data files carry the quarter in their name:
+
+```
+FreeFloatWShares_June2026.csv          public shareholding pattern (the free float)
+ForeignOwnershipLimits_June2026.csv    board-approved limit and limit utilised
+Summary_June2026.csv                   one row per company
+RunLog_June2026.csv                    what resolved, what failed and why
+```
+
+Set the destination in the sidebar under **💾 Local storage**; the app checks it
+is writable and falls back to a temp directory if not. A live panel shows each
+file's row count and size growing during the run.
+
+Files are flushed after every company, so an interrupted run loses nothing.
+Verified by hard-killing a run mid-flight: the CSV was valid and complete up to
+the last finished company, and a full Excel workbook could still be rebuilt from
+it. Existing files are never overwritten — a second run on the same quarter
+writes `FreeFloatWShares_June2026_2.csv`.
+
 ### Scale
 
 Roughly measured against the live API:
