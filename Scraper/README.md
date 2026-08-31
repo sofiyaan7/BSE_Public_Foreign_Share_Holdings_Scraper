@@ -52,9 +52,18 @@ Summary_June2026.csv                   one row per company
 RunLog_June2026.csv                    what resolved, what failed and why
 ```
 
-Set the destination in the sidebar under **💾 Local storage**; the app checks it
-is writable and falls back to a temp directory if not. A live panel shows each
-file's row count and size growing during the run.
+Set the destination in the sidebar under **💾 Local storage**; the resolved
+absolute path is shown so you always know where files went. `~` and `$HOME` are
+expanded, and relative paths are made absolute. A live panel shows each file's
+row count and size growing during the run.
+
+If you see *"Can't write to X — saving to /tmp/bse_shp_runs instead"*, the app
+could not create files in the folder you asked for and used a temp directory.
+Scraping still works and data is still saved. It is expected on a hosted
+deployment, where the app directory is read-only — but a temp folder can be
+cleared when the app restarts, and you cannot browse it from the browser, so use
+the download buttons to keep a copy. Running locally, it usually means a typo or
+a folder you don't have permission to write to.
 
 Files are flushed after every company, so an interrupted run loses nothing.
 Verified by hard-killing a run mid-flight: the CSV was valid and complete up to

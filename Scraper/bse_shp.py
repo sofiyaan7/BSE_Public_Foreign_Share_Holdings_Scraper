@@ -578,6 +578,11 @@ SUMMARY_HEADER = ["Scrip Code", "Company", "Quarter", "Total Public Shares Held"
                   "Foreign Ownership Rows", "Status", "Note"]
 
 
+def normalise_path(path: str) -> str:
+    """~ / $VARS expanded and made absolute."""
+    return os.path.abspath(os.path.expanduser(os.path.expandvars((path or "").strip())))
+
+
 def pick_run_dir(preferred: str | None = None) -> str:
     """A directory we can actually write to.
 
@@ -587,7 +592,17 @@ def pick_run_dir(preferred: str | None = None) -> str:
     """
     import tempfile
 
-    candidates = [preferred] if preferred else []
+    def normalise(path: str) -> str:
+        """~ and $VARS expanded, then made absolute.
+
+        Without this, typing '~/Desktop/data' creates a directory literally
+        named '~' in the working directory, and a relative path lands wherever
+        the process happens to be running.
+        """
+        return os.path.abspath(
+            os.path.expanduser(os.path.expandvars(path.strip())))
+
+    candidates = [normalise(preferred)] if preferred and preferred.strip() else []
     candidates.append(os.path.join(tempfile.gettempdir(), "bse_shp_runs"))
     for cand in candidates:
         if not cand:

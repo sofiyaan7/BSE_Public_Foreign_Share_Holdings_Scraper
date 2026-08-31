@@ -149,9 +149,15 @@ save_dir_in = st.sidebar.text_input(
     "Folder for the CSV files", value=RUNS_DIR,
     help="Rows are appended here as they are scraped, so nothing is held in "
          "memory waiting for the run to finish.")
-save_dir = bse.pick_run_dir(save_dir_in.strip() or RUNS_DIR)
-if os.path.abspath(save_dir) != os.path.abspath(save_dir_in.strip() or RUNS_DIR):
-    st.sidebar.warning(f"That folder isn't writable — using `{save_dir}`")
+_asked = bse.normalise_path(save_dir_in or RUNS_DIR)
+save_dir = bse.pick_run_dir(save_dir_in or RUNS_DIR)
+if save_dir != _asked:
+    st.sidebar.warning(
+        f"Can't write to `{_asked}` — saving to `{save_dir}` instead. "
+        f"Files are still being saved; use the download buttons to keep a copy, "
+        f"since a temp folder can be cleared when the app restarts.")
+elif save_dir != (save_dir_in or "").strip():
+    st.sidebar.caption(f"Saving to `{save_dir}`")
 _tag = sel["label"].replace(" ", "")
 st.sidebar.caption(
     "Two data files are written continuously:  \n"
