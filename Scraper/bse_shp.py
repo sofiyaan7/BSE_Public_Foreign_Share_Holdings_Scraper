@@ -17,10 +17,16 @@ same calls the website itself makes:
 
 from __future__ import annotations
 
+import csv
+import io
+import os
 import re
+import threading
 import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -253,6 +259,7 @@ class CompanyResult:
     foreign_rows: list = field(default_factory=list)
     status: str = "OK"
     message: str = ""
+    input_token: str = ""
 
     @property
     def total_public_shares(self):
@@ -282,14 +289,18 @@ def scrape_company(session, token_or_resolved, quarter_label, qtrid,
         except (LookupError, ValueError) as exc:
             return CompanyResult(scripcode="", name=str(token_or_resolved),
                                  quarter=quarter_label, qtrid=qtrid,
-                                 status="NOT FOUND", message=str(exc))
+                                 status="NOT FOUND", message=str(exc),
+                                 input_token=str(token_or_resolved))
         except requests.RequestException as exc:
             return CompanyResult(scripcode="", name=str(token_or_resolved),
                                  quarter=quarter_label, qtrid=qtrid,
-                                 status="ERROR", message=f"lookup failed: {exc}")
+                                 status="ERROR", message=f"lookup failed: {exc}",
+                                 input_token=str(token_or_resolved))
 
+    token = (token_or_resolved if isinstance(token_or_resolved, str)
+             else info.get("name") or str(info.get("scripcode", "")))
     res = CompanyResult(scripcode=str(info["scripcode"]), name=info["name"],
-                        quarter=quarter_label, qtrid=qtrid)
+                        quarter=quarter_label, qtrid=qtrid, input_token=token)
     try:
         res.public_rows = fetch_public_shareholding(
             session, res.scripcode, res.name, quarter_label, qtrid, keep_zero_rows)
@@ -348,9 +359,6 @@ def summary_rows(results: list[CompanyResult]) -> list[dict]:
 def build_workbook(public_rows, foreign_rows, log_rows, results,
                    quarter, qtrid) -> bytes:
     """Render the scraped data into a multi-sheet .xlsx and return its bytes."""
-    import io
-    from datetime import datetime
-
     import pandas as pd
 
     def frame(rows):
@@ -381,3 +389,266 @@ def build_workbook(public_rows, foreign_rows, log_rows, results,
                 ws.column_dimensions[cells[0].column_letter].width = min(
                     max(width + 2, 10), 55)
     return buf.getvalue()
+
+
+# ------------------------------------------------- the whole BSE universe -----
+SCRIP_LIST_COLUMNS = {
+    "SCRIP_CD": "scripcode", "Scrip_Name": "name", "scrip_id": "ticker",
+    "GROUP": "group", "ISIN_NUMBER": "isin", "FACE_VALUE": "face_value",
+    "Mktcap": "mktcap", "Status": "status", "Segment": "segment",
+}
+
+
+def list_all_companies(session: requests.Session, group: str = "",
+                       status: str = "Active", segment: str = "Equity",
+                       name_like: str = "") -> list[dict]:
+    """Every BSE-listed company in a segment — the full scrip master."""
+    d = _get_json(session, "ListofScripData_new/w",
+                  {"Group": group, "Scripcode": "", "segment": segment,
+                   "status": status, "scripName": name_like}, timeout=120)
+    rows = d if isinstance(d, list) else (d.get("Table") or [])
+    out = []
+    for raw in rows:
+        c = {dst: raw.get(src) for src, dst in SCRIP_LIST_COLUMNS.items()}
+        if not c["scripcode"]:
+            continue
+        c["scripcode"] = str(c["scripcode"]).strip()
+        c["name"] = (c["name"] or "").strip()
+        try:
+            c["mktcap_cr"] = float(c["mktcap"]) if c["mktcap"] else None
+        except (TypeError, ValueError):
+            c["mktcap_cr"] = None
+        out.append(c)
+    return out
+
+
+# BSE's equity segment also lists ETFs and mutual-fund schemes. They file no
+# meaningful shareholding pattern, so a full-universe run can skip them.
+_FUND_MARKERS = (
+    " ETF", "ETF ", "MUTUAL FUND", "SEGREGATED PORTFOLIO", "DIVIDEND PLAN",
+    "GROWTH PLAN", "INDEX FUND", "BHARAT BOND", "IDCW", "REINVESTMENT",
+    "-  SEGREGATED", "LIQUID FUND", "GILT FUND", "ARBITRAGE FUND",
+    "DIRECT PLAN", "REGULAR PLAN", "PLAN-GROWTH", "PLAN - GROWTH",
+    "DIRECT GROWTH", "REGULAR GROWTH", "LONG-SHORT FUND", "LONG- SHORT FUND",
+    "EXCHANGE TRADED FUND",
+)
+
+
+def looks_like_fund(name: str) -> bool:
+    n = (name or "").upper().strip()
+    # "…LogisticsETF" has no separator before the suffix
+    return n.endswith("ETF") or any(m in n for m in _FUND_MARKERS)
+
+
+def filter_universe(companies: list[dict], groups: list[str] | None = None,
+                    min_mktcap_cr: float | None = None,
+                    sort_by: str = "name", limit: int | None = None,
+                    exclude_funds: bool = False) -> list[dict]:
+    """Narrow / order the universe before a run."""
+    sel = list(companies)
+    if exclude_funds:
+        sel = [c for c in sel if not looks_like_fund(c.get("name", ""))]
+    if groups:
+        want = {g.upper() for g in groups}
+        sel = [c for c in sel if (c.get("group") or "").upper() in want]
+    if min_mktcap_cr is not None:
+        sel = [c for c in sel
+               if c.get("mktcap_cr") is not None and c["mktcap_cr"] >= min_mktcap_cr]
+    if sort_by == "mktcap":
+        sel.sort(key=lambda c: (c.get("mktcap_cr") is None,
+                                -(c.get("mktcap_cr") or 0)))
+    elif sort_by == "scripcode":
+        sel.sort(key=lambda c: c["scripcode"])
+    else:
+        sel.sort(key=lambda c: c["name"].upper())
+    return sel[:limit] if limit else sel
+
+
+# ----------------------------------------------------- concurrent scraping ----
+_local = threading.local()
+
+
+def thread_session() -> requests.Session:
+    """One requests.Session per worker thread (Sessions aren't thread-safe)."""
+    s = getattr(_local, "session", None)
+    if s is None:
+        s = _local.session = make_session()
+    return s
+
+
+def scrape_many(companies, quarter_label: str, qtrid: str, workers: int = 8,
+                keep_zero_rows: bool = True, pause: float = 0.0,
+                should_stop=None):
+    """Scrape many companies concurrently, yielding each CompanyResult as it lands.
+
+    `companies` may hold plain tokens (names / codes) or already-resolved dicts
+    with `scripcode` + `name`. Results arrive out of order — that is the point.
+    """
+    def work(item):
+        return scrape_company(thread_session(), item, quarter_label, qtrid,
+                              keep_zero_rows=keep_zero_rows, pause=pause)
+
+    ex = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+    try:
+        futures = {ex.submit(work, c): c for c in companies}
+        for fut in as_completed(futures):
+            yield fut.result()
+            if should_stop is not None and should_stop():
+                break
+    finally:
+        # don't block the UI waiting on in-flight requests if we bail out early
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
+# -------------------------------------------------- disk-backed run writer ----
+PUBLIC_HEADER = _ID_COLS + ["Row Type"] + list(PUBLIC_COLUMNS.values())
+FOREIGN_HEADER = _ID_COLS + list(FOREIGN_COLUMNS.values())
+LOG_HEADER = ["#", "Input", "Scrip Code", "Company", "Quarter", "Group",
+              "Public Rows", "Foreign Rows", "Status", "Note"]
+SUMMARY_HEADER = ["Scrip Code", "Company", "Quarter", "Total Public Shares Held",
+                  "Public Holding % (A+B+C2)", "Public Rows",
+                  "Foreign Ownership Rows", "Status", "Note"]
+
+
+class RunWriter:
+    """Streams scraped rows straight to CSV.
+
+    A full-universe run is ~140k public rows; holding that in Streamlit's
+    session state is asking for trouble, so rows go to disk as they arrive and
+    only counters plus a small rolling preview stay in memory.
+    """
+
+    def __init__(self, out_dir: str, quarter: str, qtrid: str,
+                 preview_cap: int = 600):
+        self.dir = out_dir
+        os.makedirs(self.dir, exist_ok=True)
+        self.quarter, self.qtrid = quarter, qtrid
+        self.preview_cap = preview_cap
+        self.paths = {n: os.path.join(self.dir, f"{n}.csv")
+                      for n in ("public", "foreign", "log", "summary")}
+
+        self._fh, self._w = {}, {}
+        for name, header in (("public", PUBLIC_HEADER), ("foreign", FOREIGN_HEADER),
+                             ("log", LOG_HEADER), ("summary", SUMMARY_HEADER)):
+            fh = open(self.paths[name], "w", newline="", encoding="utf-8-sig")
+            w = csv.DictWriter(fh, fieldnames=header, extrasaction="ignore")
+            w.writeheader()
+            self._fh[name], self._w[name] = fh, w
+
+        self.companies = 0
+        self.public_rows = 0
+        self.foreign_rows = 0
+        self.status_counts: dict[str, int] = {}
+        self.preview_public: list[dict] = []
+        self.preview_foreign: list[dict] = []
+        self.log: list[dict] = []
+
+    def add(self, res: CompanyResult, source_input: str = "",
+            group: str = "") -> None:
+        self.companies += 1
+        for row in res.public_rows:
+            self._w["public"].writerow(row)
+        for row in res.foreign_rows:
+            self._w["foreign"].writerow(row)
+        self.public_rows += len(res.public_rows)
+        self.foreign_rows += len(res.foreign_rows)
+        self.status_counts[res.status] = self.status_counts.get(res.status, 0) + 1
+
+        log_row = {"#": self.companies,
+                   "Input": source_input or res.input_token or res.name,
+                   "Scrip Code": res.scripcode, "Company": res.name,
+                   "Quarter": res.quarter, "Group": group,
+                   "Public Rows": len(res.public_rows),
+                   "Foreign Rows": len(res.foreign_rows),
+                   "Status": res.status, "Note": res.message}
+        self._w["log"].writerow(log_row)
+        self.log.append(log_row)
+        self._w["summary"].writerow(summary_rows([res])[0])
+
+        if res.public_rows:
+            self.preview_public = (self.preview_public + res.public_rows)[-self.preview_cap:]
+        if res.foreign_rows:
+            self.preview_foreign = (self.preview_foreign + res.foreign_rows)[-self.preview_cap:]
+
+        if self.companies % 20 == 0:
+            self.flush()
+
+    def flush(self) -> None:
+        for fh in self._fh.values():
+            try:
+                fh.flush()
+            except ValueError:
+                pass
+
+    def close(self) -> None:
+        for fh in self._fh.values():
+            try:
+                fh.close()
+            except ValueError:
+                pass
+
+    # ------------------------------------------------------------- exports ----
+    def about_rows(self) -> list[dict]:
+        return [
+            {"Field": "Source", "Value": "BSE India (bseindia.com)"},
+            {"Field": "Quarter", "Value": self.quarter},
+            {"Field": "BSE quarter id", "Value": self.qtrid},
+            {"Field": "Generated",
+             "Value": datetime.now().strftime("%d %b %Y %H:%M:%S")},
+            {"Field": "Companies scraped", "Value": self.companies},
+            {"Field": "Public shareholding rows", "Value": self.public_rows},
+            {"Field": "Foreign ownership rows", "Value": self.foreign_rows},
+            {"Field": "Status breakdown",
+             "Value": ", ".join(f"{k}: {v}" for k, v in
+                                sorted(self.status_counts.items())) or "—"},
+        ]
+
+    def zip_bytes(self) -> bytes:
+        """Every sheet as a CSV inside one zip — safe at any size."""
+        self.flush()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            about = io.StringIO()
+            aw = csv.DictWriter(about, fieldnames=["Field", "Value"])
+            aw.writeheader()
+            aw.writerows(self.about_rows())
+            z.writestr("00_about.csv", about.getvalue())
+            for label, name in (("01_summary", "summary"),
+                                ("02_public_shareholding", "public"),
+                                ("03_foreign_ownership_limits", "foreign"),
+                                ("04_run_log", "log")):
+                if os.path.exists(self.paths[name]):
+                    z.write(self.paths[name], f"{label}.csv")
+        return buf.getvalue()
+
+    def excel_bytes(self, max_rows: int = 400_000) -> bytes:
+        """Multi-sheet .xlsx read back off the CSVs."""
+        import pandas as pd
+
+        self.flush()
+
+        def read(name):
+            path = self.paths[name]
+            if not os.path.exists(path):
+                return pd.DataFrame({"Note": ["no data"]})
+            df = pd.read_csv(path, dtype={"Scrip Code": "Int64"},
+                             nrows=max_rows, low_memory=False)
+            return df if not df.empty else pd.DataFrame({"Note": ["no data"]})
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+            pd.DataFrame(self.about_rows()).to_excel(
+                xl, sheet_name="About", index=False)
+            read("summary").to_excel(xl, sheet_name="Summary", index=False)
+            read("public").to_excel(xl, sheet_name="Public Shareholding",
+                                    index=False)
+            read("foreign").to_excel(xl, sheet_name="Foreign Ownership Limits",
+                                     index=False)
+            read("log").to_excel(xl, sheet_name="Run Log", index=False)
+            for ws in xl.book.worksheets:
+                ws.freeze_panes = "A2"
+                for cells in ws.iter_cols(min_row=1, max_row=1):
+                    col = cells[0]
+                    width = max(len(str(col.value or "")) + 2, 12)
+                    ws.column_dimensions[col.column_letter].width = min(width, 55)
+        return buf.getvalue()

@@ -1,7 +1,13 @@
-"""Streamlit front-end for the BSE shareholding-pattern scraper."""
+"""Streamlit front-end for the BSE shareholding-pattern scraper.
+
+Two ways to choose what to scrape:
+  * the entire BSE listed universe for a quarter, optionally filtered, or
+  * a hand-picked list of names / scrip codes.
+"""
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 
@@ -14,22 +20,31 @@ st.set_page_config(page_title="BSE Shareholding Pattern Scraper",
                    page_icon="📊", layout="wide")
 
 SAMPLE = "Reliance Industries\nTata Consultancy Services\nHDFC Bank\nInfosys"
+RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+ALL_MODE = "🌐 All BSE listed companies"
+MANUAL_MODE = "✍️ Pick companies manually"
+
 
 # ------------------------------------------------------------------- state ----
-def _init():
-    d = {"results": [], "pub": [], "fo": [], "log": [],
-         "running": False, "done": False, "quarter": "", "qtrid": "",
-         "started": None, "elapsed": 0.0}
-    for k, v in d.items():
-        st.session_state.setdefault(k, v)
-
-
-_init()
+for key, val in {"writer": None, "running": False, "done": False,
+                 "quarter": "", "elapsed": 0.0, "last": None,
+                 "interrupted": False}.items():
+    st.session_state.setdefault(key, val)
 
 
 def reset_run():
-    st.session_state.update(results=[], pub=[], fo=[], log=[],
-                            done=False, elapsed=0.0)
+    w = st.session_state.writer
+    if w is not None:
+        w.close()
+    st.session_state.update(writer=None, done=False, elapsed=0.0, last=None,
+                            interrupted=False)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_universe(segment: str, status: str) -> list[dict]:
+    """The BSE scrip master. Cached for an hour — it barely moves."""
+    return bse.list_all_companies(bse.make_session(), segment=segment,
+                                  status=status)
 
 
 # ------------------------------------------------------------------ sidebar ---
@@ -38,54 +53,118 @@ st.sidebar.caption("Public shareholding pattern + foreign ownership limits, "
                    "straight from BSE's own APIs.")
 
 quarters = bse.quarter_choices(from_year=2016)
-labels = [q["label"] for q in quarters]
 sel_label = st.sidebar.selectbox(
-    "Quarter", labels, index=0,
-    help="Quarters are listed newest first. The latest one is the most recent "
-         "quarter companies have filed for.")
+    "Quarter", [q["label"] for q in quarters], index=0,
+    help="Newest first. The top entry is the most recent quarter companies "
+         "have filed for.")
 sel = next(q for q in quarters if q["label"] == sel_label)
 st.sidebar.caption(f"BSE quarter id `{sel['qtrid']}`")
 
-st.sidebar.markdown("### Companies")
-src = st.sidebar.radio("Input", ["Type / paste", "Upload CSV"],
-                       horizontal=True, label_visibility="collapsed")
+st.sidebar.markdown("### What to scrape")
+mode = st.sidebar.radio("Universe", [ALL_MODE, MANUAL_MODE],
+                        label_visibility="collapsed")
 
-tokens: list[str] = []
-if src == "Type / paste":
-    raw = st.sidebar.text_area(
-        "One company name or scrip code per line", value=SAMPLE, height=170,
-        help="Names are resolved through BSE's search, so 'Reliance Industries' "
-             "or '500325' both work.")
-    tokens = bse.parse_company_input(raw)
+targets: list = []
+group_of: dict[str, str] = {}
+universe: list[dict] = []
+
+if mode == ALL_MODE:
+    try:
+        universe = load_universe("Equity", "Active")
+    except Exception as exc:  # noqa: BLE001 - shown to the user
+        st.sidebar.error(f"Could not load the BSE scrip master: {exc}")
+        universe = []
+
+    if universe:
+        st.sidebar.success(f"{len(universe):,} active equity companies listed")
+        all_groups = sorted({(c.get("group") or "?") for c in universe})
+        with st.sidebar.expander("🔍 Narrow it down (optional)", expanded=True):
+            groups = st.multiselect(
+                "Groups", all_groups, default=[],
+                help="Blank = every group. 'A' is the large, liquid end "
+                     "(~700 companies); B and X are the long tail.")
+            min_mcap = st.number_input(
+                "Minimum market cap (₹ crore)", min_value=0.0, value=0.0,
+                step=100.0,
+                help="0 = no market-cap filter. Companies with no reported "
+                     "market cap are dropped when this is above 0.")
+            sort_by = st.selectbox("Order", ["mktcap", "name", "scripcode"],
+                                   format_func={"mktcap": "Largest first",
+                                                "name": "Company name",
+                                                "scripcode": "Scrip code"}.get)
+            limit = st.number_input(
+                "Stop after N companies (0 = all)", min_value=0,
+                max_value=len(universe), value=0, step=50,
+                help="Handy for a trial run — pair it with 'Largest first'.")
+            no_funds = st.checkbox(
+                "Exclude ETFs / mutual-fund schemes", value=True,
+                help="BSE's equity segment also lists ETFs and fund schemes, "
+                     "which file no meaningful shareholding pattern.")
+
+        targets = bse.filter_universe(
+            universe, groups=groups or None,
+            min_mktcap_cr=min_mcap if min_mcap > 0 else None,
+            sort_by=sort_by, limit=int(limit) or None,
+            exclude_funds=no_funds)
+        if no_funds:
+            dropped = sum(1 for c in universe if bse.looks_like_fund(c["name"]))
+            if dropped:
+                st.sidebar.caption(f"Skipping {dropped:,} ETF / fund listings")
+        group_of = {c["scripcode"]: (c.get("group") or "") for c in targets}
 else:
-    up = st.sidebar.file_uploader("CSV / TXT", type=["csv", "txt"])
-    col_hint = st.sidebar.text_input("Column to read (blank = first column)", "")
-    if up is not None:
-        try:
-            if up.name.lower().endswith(".txt"):
-                tokens = bse.parse_company_input(up.getvalue().decode("utf-8", "ignore"))
-            else:
-                df_in = pd.read_csv(up, dtype=str).fillna("")
-                col = col_hint.strip() or df_in.columns[0]
-                if col not in df_in.columns:
-                    st.sidebar.error(f"No column {col!r}. Found: {list(df_in.columns)}")
+    src = st.sidebar.radio("Input", ["Type / paste", "Upload CSV"],
+                           horizontal=True, label_visibility="collapsed")
+    if src == "Type / paste":
+        raw = st.sidebar.text_area(
+            "One company name or scrip code per line", value=SAMPLE, height=170,
+            help="Names go through BSE's search, so 'Reliance Industries' or "
+                 "'500325' both work.")
+        targets = bse.parse_company_input(raw)
+    else:
+        up = st.sidebar.file_uploader("CSV / TXT", type=["csv", "txt"])
+        col_hint = st.sidebar.text_input("Column to read (blank = first)", "")
+        if up is not None:
+            try:
+                if up.name.lower().endswith(".txt"):
+                    targets = bse.parse_company_input(
+                        up.getvalue().decode("utf-8", "ignore"))
                 else:
-                    tokens = bse.parse_company_input("\n".join(df_in[col].tolist()))
-        except Exception as exc:  # noqa: BLE001 - surfaced to the user
-            st.sidebar.error(f"Could not read file: {exc}")
+                    df_in = pd.read_csv(up, dtype=str).fillna("")
+                    col = col_hint.strip() or df_in.columns[0]
+                    if col not in df_in.columns:
+                        st.sidebar.error(
+                            f"No column {col!r}. Found: {list(df_in.columns)}")
+                    else:
+                        targets = bse.parse_company_input(
+                            "\n".join(df_in[col].tolist()))
+            except Exception as exc:  # noqa: BLE001 - shown to the user
+                st.sidebar.error(f"Could not read file: {exc}")
 
 with st.sidebar.expander("⚙️ Options"):
-    pause = st.slider("Pause between requests (sec)", 0.0, 2.0, 0.35, 0.05,
-                      help="Be gentle with BSE. 0.35s is a good default.")
+    workers = st.slider("Parallel workers", 1, 16, 8,
+                        help="8 gets through the full BSE list in roughly "
+                             "35 minutes. Higher is faster but harder on BSE.")
+    pause = st.slider("Pause per request (sec)", 0.0, 2.0, 0.0, 0.05,
+                      help="Extra politeness delay inside each worker. Leave "
+                           "at 0 when running in parallel.")
     keep_zero = st.checkbox("Keep category header rows", value=True,
                             help="Header rows such as 'Institutions' carry no "
                                  "numbers. Untick for a tighter sheet.")
-    preview_rows = st.number_input("Preview rows to show", 10, 2000, 250, 10)
+    preview_rows = st.number_input("Preview rows to show", 10, 2000, 200, 10)
+    repaint_every = st.number_input(
+        "Refresh tables every N companies", 1, 200, 5, 1,
+        help="Small numbers feel livelier; larger numbers keep long runs fast.")
 
-st.sidebar.write(f"**{len(tokens)}** companies queued")
+n_targets = len(targets)
+if n_targets:
+    eta = n_targets / max(workers * 0.3, 0.3) / 60
+    st.sidebar.info(f"**{n_targets:,}** companies queued · "
+                    f"~{eta:.0f} min at {workers} workers")
+else:
+    st.sidebar.warning("Nothing queued yet.")
+
 start = st.sidebar.button("🚀 Start scraping", type="primary",
-                          use_container_width=True,
-                          disabled=not tokens or st.session_state.running)
+                          use_container_width=True, disabled=not n_targets)
 if st.sidebar.button("🧹 Clear results", use_container_width=True):
     reset_run()
     st.rerun()
@@ -94,69 +173,81 @@ if st.sidebar.button("🧹 Clear results", use_container_width=True):
 st.title("BSE Shareholding Pattern Scraper")
 st.markdown(
     "Pulls the **Statement showing shareholding pattern of the Public "
-    "shareholder** and the **Statement showing foreign ownership limits** "
-    "for every company you list, for the quarter you pick — then exports the lot "
-    "to Excel.")
+    "shareholder** and the **Statement showing foreign ownership limits** for "
+    "the quarter you pick — for every BSE-listed company, or just the ones you "
+    "name — then exports the lot to Excel.")
 
 kpi_slot = st.empty()
 prog_slot = st.empty()
 now_slot = st.empty()
 
-tab_pub, tab_fo, tab_last, tab_log = st.tabs(
-    ["🧾 Public Shareholding", "🌍 Foreign Ownership Limits",
-     "🔎 Last Company", "📋 Run Log"])
-with tab_pub:
+tabs = st.tabs(["🧾 Public Shareholding", "🌍 Foreign Ownership Limits",
+                "🔎 Last Company", "📋 Run Log", "🌐 Universe"])
+with tabs[0]:
     pub_slot = st.empty()
-with tab_fo:
+with tabs[1]:
     fo_slot = st.empty()
-with tab_last:
+with tabs[2]:
     last_slot = st.empty()
-with tab_log:
+with tabs[3]:
     log_slot = st.empty()
+with tabs[4]:
+    if universe:
+        st.caption(f"BSE scrip master — {len(universe):,} active equity "
+                   f"companies. {n_targets:,} selected for this run.")
+        st.dataframe(pd.DataFrame(targets or universe)[
+            ["scripcode", "name", "ticker", "group", "isin", "mktcap_cr"]],
+            use_container_width=True, hide_index=True, height=430)
+    else:
+        st.info("Switch to **🌐 All BSE listed companies** to load the "
+                "full scrip master.")
 
 dl_slot = st.empty()
 
 
 # ------------------------------------------------------------------ painting --
 def paint_kpis(done_n, total_n):
-    ok = sum(1 for r in st.session_state.log if r["Status"] == "OK")
-    bad = sum(1 for r in st.session_state.log
-              if r["Status"] in ("ERROR", "NOT FOUND"))
-    part = sum(1 for r in st.session_state.log
-               if r["Status"] in ("PARTIAL", "NO DATA"))
+    w = st.session_state.writer
+    sc = w.status_counts if w else {}
     with kpi_slot.container():
         c = st.columns(6)
-        c[0].metric("Companies", f"{done_n}/{total_n}")
-        c[1].metric("Complete", ok)
-        c[2].metric("Partial / none", part)
-        c[3].metric("Failed", bad)
-        c[4].metric("Public rows", f"{len(st.session_state.pub):,}")
-        c[5].metric("Foreign rows", f"{len(st.session_state.fo):,}")
+        c[0].metric("Companies", f"{done_n:,}/{total_n:,}")
+        c[1].metric("Complete", f"{sc.get('OK', 0):,}")
+        c[2].metric("Partial / none",
+                    f"{sc.get('PARTIAL', 0) + sc.get('NO DATA', 0):,}")
+        c[3].metric("Failed",
+                    f"{sc.get('ERROR', 0) + sc.get('NOT FOUND', 0):,}")
+        c[4].metric("Public rows", f"{(w.public_rows if w else 0):,}")
+        c[5].metric("Foreign rows", f"{(w.foreign_rows if w else 0):,}")
 
 
 def paint_tables(limit):
-    if st.session_state.pub:
-        df = pd.DataFrame(st.session_state.pub)
-        pub_slot.dataframe(df.tail(int(limit)), use_container_width=True,
-                           hide_index=True, height=430)
+    w = st.session_state.writer
+    limit = int(limit)
+    if w and w.preview_public:
+        pub_slot.dataframe(pd.DataFrame(w.preview_public).tail(limit),
+                           use_container_width=True, hide_index=True, height=430)
     else:
         pub_slot.info("No public-shareholding rows yet.")
-    if st.session_state.fo:
-        fo_slot.dataframe(pd.DataFrame(st.session_state.fo).tail(int(limit)),
+    if w and w.preview_foreign:
+        fo_slot.dataframe(pd.DataFrame(w.preview_foreign).tail(limit),
                           use_container_width=True, hide_index=True, height=430)
     else:
         fo_slot.info("No foreign-ownership rows yet.")
-    if st.session_state.log:
-        log_slot.dataframe(pd.DataFrame(st.session_state.log),
+    if w and w.log:
+        log_slot.dataframe(pd.DataFrame(w.log[-limit:]),
                            use_container_width=True, hide_index=True, height=430)
     else:
         log_slot.info("Run log is empty.")
 
 
 def paint_last(res):
+    if res is None:
+        last_slot.info("Nothing scraped yet.")
+        return
     with last_slot.container():
         head = st.columns(4)
-        head[0].metric("Company", res.name[:24] or "—")
+        head[0].metric("Company", (res.name or "—")[:24])
         head[1].metric("Scrip", res.scripcode or "—")
         shares = res.total_public_shares
         head[2].metric("Public shares held",
@@ -169,35 +260,40 @@ def paint_last(res):
                          hide_index=True, height=260)
         if res.foreign_rows:
             st.caption("Foreign ownership limits")
-            st.dataframe(pd.DataFrame(res.foreign_rows), use_container_width=True,
-                         hide_index=True, height=200)
-
-
-# -------------------------------------------------------------------- Excel ---
-def build_excel() -> bytes:
-    return bse.build_workbook(
-        st.session_state.pub, st.session_state.fo, st.session_state.log,
-        st.session_state.results, st.session_state.quarter,
-        st.session_state.qtrid)
+            st.dataframe(pd.DataFrame(res.foreign_rows),
+                         use_container_width=True, hide_index=True, height=200)
+        if res.message:
+            st.warning(res.message)
 
 
 def paint_download():
-    if not (st.session_state.pub or st.session_state.fo):
+    w = st.session_state.writer
+    if not w or (w.public_rows == 0 and w.foreign_rows == 0):
         return
     stamp = st.session_state.quarter.replace(" ", "_")
+    big = w.public_rows > 250_000
     with dl_slot.container():
         st.divider()
-        c1, c2 = st.columns([1, 2])
-        c1.download_button(
-            "⬇️ Export to Excel", data=build_excel(),
+        c1, c2, c3 = st.columns([1, 1, 2])
+        if big:
+            c1.caption("⚠️ Over 250k rows — the CSV bundle is the safer export.")
+        else:
+            c1.download_button(
+                "⬇️ Export to Excel", data=w.excel_bytes(),
+                file_name=f"BSE_Shareholding_{stamp}_"
+                          f"{datetime.now():%Y%m%d_%H%M}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument."
+                     "spreadsheetml.sheet",
+                type="primary", use_container_width=True)
+        c2.download_button(
+            "⬇️ Export CSV bundle (.zip)", data=w.zip_bytes(),
             file_name=f"BSE_Shareholding_{stamp}_"
-                      f"{datetime.now():%Y%m%d_%H%M}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument."
-                 "spreadsheetml.sheet",
-            type="primary", use_container_width=True)
-        c2.caption("Workbook sheets: **About**, **Summary**, "
-                   "**Public Shareholding**, **Foreign Ownership Limits**, "
-                   "**Run Log**.")
+                      f"{datetime.now():%Y%m%d_%H%M}.zip",
+            mime="application/zip",
+            type="primary" if big else "secondary", use_container_width=True)
+        c3.caption("Sheets: **About**, **Summary**, **Public Shareholding**, "
+                   "**Foreign Ownership Limits**, **Run Log**.  \n"
+                   f"Raw CSVs also on disk at `{w.dir}`")
 
 
 # ---------------------------------------------------------------- the scrape --
@@ -205,66 +301,71 @@ if start:
     reset_run()
     st.session_state.running = True
     st.session_state.quarter = sel["label"]
-    st.session_state.qtrid = sel["qtrid"]
-    t0 = time.time()
-    session = bse.make_session()
-    bar = prog_slot.progress(0.0, text="Warming up BSE session…")
-    total = len(tokens)
+    run_dir = os.path.join(
+        RUNS_DIR, f"{datetime.now():%Y%m%d_%H%M%S}_{sel['label'].replace(' ', '')}")
+    writer = bse.RunWriter(run_dir, sel["label"], sel["qtrid"])
+    st.session_state.writer = writer
 
+    bar = prog_slot.progress(0.0, text="Starting workers…")
+    t0 = time.time()
+    done = 0
     try:
-        for i, tok in enumerate(tokens, start=1):
-            bar.progress((i - 1) / total,
-                         text=f"[{i}/{total}] Fetching **{tok}** — {sel['label']}")
-            res = bse.scrape_company(session, tok, sel["label"], sel["qtrid"],
-                                     keep_zero_rows=keep_zero, pause=pause)
-            st.session_state.results.append(res)
-            st.session_state.pub.extend(res.public_rows)
-            st.session_state.fo.extend(res.foreign_rows)
-            st.session_state.log.append({
-                "#": i, "Input": tok, "Scrip Code": res.scripcode,
-                "Company": res.name, "Quarter": res.quarter,
-                "Public Rows": len(res.public_rows),
-                "Foreign Rows": len(res.foreign_rows),
-                "Status": res.status, "Note": res.message,
-            })
+        for res in bse.scrape_many(targets, sel["label"], sel["qtrid"],
+                                   workers=workers, keep_zero_rows=keep_zero,
+                                   pause=pause):
+            writer.add(res, group=group_of.get(res.scripcode, ""))
+            done += 1
+            st.session_state.last = res
 
             icon = {"OK": "✅", "PARTIAL": "⚠️", "NO DATA": "➖",
                     "NOT FOUND": "❓", "ERROR": "❌"}.get(res.status, "•")
+            rate = done / max(time.time() - t0, 0.001)
+            left = (n_targets - done) / rate if rate else 0
+            bar.progress(done / n_targets,
+                         text=f"{done:,}/{n_targets:,} · {rate:.1f} co/s · "
+                              f"~{left / 60:.0f} min left")
             now_slot.markdown(
                 f"{icon} **{res.name}** ({res.scripcode or 'n/a'}) — "
                 f"{len(res.public_rows)} public rows, "
                 f"{len(res.foreign_rows)} foreign-ownership rows"
                 + (f" · _{res.message}_" if res.message else ""))
-            paint_kpis(i, total)
-            paint_tables(preview_rows)
-            paint_last(res)
-            bar.progress(i / total, text=f"[{i}/{total}] done — {res.name}")
-            if pause:
-                time.sleep(pause)
+
+            if done % int(repaint_every) == 0 or done == n_targets:
+                paint_kpis(done, n_targets)
+                paint_tables(preview_rows)
+                paint_last(res)
+    except Exception as exc:  # noqa: BLE001 - keep partial data usable
+        st.session_state.interrupted = True
+        st.error(f"Run stopped early: {exc}")
     finally:
+        writer.flush()
+        writer.close()
         st.session_state.running = False
         st.session_state.done = True
         st.session_state.elapsed = time.time() - t0
 
-    bar.progress(1.0, text=f"Finished {total} companies in "
-                           f"{st.session_state.elapsed:.1f}s")
+    paint_kpis(done, n_targets)
+    paint_tables(preview_rows)
+    paint_last(st.session_state.last)
+    bar.progress(1.0, text=f"Finished {done:,} companies in "
+                           f"{st.session_state.elapsed / 60:.1f} min")
     paint_download()
 
-elif st.session_state.done:
-    paint_kpis(len(st.session_state.results), len(st.session_state.results))
-    n = len(st.session_state.results)
+elif st.session_state.done and st.session_state.writer is not None:
+    w = st.session_state.writer
+    paint_kpis(w.companies, w.companies)
+    noun = "company" if w.companies == 1 else "companies"
     prog_slot.success(
-        f"Last run: **{n} {'company' if n == 1 else 'companies'}**, "
-        f"{st.session_state.quarter} — {len(st.session_state.pub):,} public rows, "
-        f"{len(st.session_state.fo):,} foreign-ownership rows "
-        f"in {st.session_state.elapsed:.1f}s")
+        f"Last run: **{w.companies:,} {noun}**, {st.session_state.quarter} — "
+        f"{w.public_rows:,} public rows, {w.foreign_rows:,} foreign-ownership "
+        f"rows in {st.session_state.elapsed / 60:.1f} min")
     paint_tables(preview_rows)
-    if st.session_state.results:
-        paint_last(st.session_state.results[-1])
+    paint_last(st.session_state.last)
     paint_download()
 
 else:
-    paint_kpis(0, len(tokens))
-    prog_slot.info("Pick a quarter, list your companies, then hit "
+    paint_kpis(0, n_targets)
+    prog_slot.info("Pick a quarter, choose your universe, then hit "
                    "**🚀 Start scraping** in the sidebar.")
     paint_tables(preview_rows)
+    paint_last(None)

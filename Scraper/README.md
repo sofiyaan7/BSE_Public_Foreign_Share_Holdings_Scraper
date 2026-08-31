@@ -23,28 +23,33 @@ streamlit run app.py
 ## Using it
 
 1. **Pick the quarter** in the sidebar (newest first).
-2. **List your companies** — one name or scrip code per line, or upload a
-   CSV/TXT. Names go through BSE's own search, so `Reliance Industries`,
-   `RELIANCE INDUSTRIES LTD` and `500325` all resolve.
-3. Hit **🚀 Start scraping**. The KPI strip, the two data tabs, the
-   *Last Company* tab and the run log all update after every company, so you
-   can watch it work.
-4. Hit **⬇️ Export to Excel**.
+2. **Choose what to scrape:**
+   - **🌐 All BSE listed companies** — pulls BSE's scrip master (~5,100 active
+     equity listings) and scrapes the lot. Optional filters: group (A / B / X /
+     …), minimum market cap, ordering, a "stop after N" cap for trial runs, and
+     an ETF/mutual-fund-scheme exclusion that is on by default.
+   - **✍️ Pick companies manually** — one name or scrip code per line, or a
+     CSV/TXT upload. Names go through BSE's own search, so `Reliance Industries`,
+     `RELIANCE INDUSTRIES LTD` and `500325` all resolve.
+3. Hit **🚀 Start scraping**. The KPI strip, both data tabs, the *Last Company*
+   tab and the run log all refresh as results land, with a live rate and ETA.
+4. Export as **Excel** or as a **CSV bundle (.zip)**.
 
-### Workbook sheets
+### Scale
 
-| Sheet | Contents |
-|---|---|
-| About | source, quarter, BSE quarter id, generated timestamp, row counts |
-| Summary | one row per company: total public shares held, public holding %, status |
-| Public Shareholding | the full public shareholder statement, all companies stacked |
-| Foreign Ownership Limits | board-approved limit and limit utilised per period |
-| Run Log | what was requested, what resolved, and every failure with its reason |
+Roughly measured against the live API:
 
-The `Row Type` column in *Public Shareholding* tells you what a row is —
-`Category header`, `Line item`, `Shareholder detail` (a named >1% holder) or
-`Sub-total` — so you can filter to whichever level you want without
-double-counting.
+| Workers | Rate | Full universe (~4,900 companies) |
+|---|---|---|
+| 4 | 1.3 co/s | ~64 min |
+| 8 (default) | 2.5 co/s | ~34 min |
+| 10–12 | 3.1–3.4 co/s | ~25 min |
+
+A full run produces about **165,000 public-shareholding rows**. Rows are
+streamed to CSV on disk as they arrive (under `runs/<timestamp>/`) rather than
+piling up in the browser session, so memory stays flat and a partial run is
+still fully exportable. Above 250k rows the app steers you to the CSV bundle,
+since openpyxl gets slow and memory-hungry at that size.
 
 ## How it works
 
@@ -57,6 +62,7 @@ read out of BSE's front-end bundle, so no HTML scraping or browser automation):
 | Foreign ownership limits | `Corp_shpforeignownership_ng/w?scripcode=&qtrid=` |
 | Quarter metadata | `Corp_shpSec_shpqtrinfo_ng/w?scripcode=&qtrcode=` |
 | Name → scrip code | `PeerSmartSearch/w?Type=SS&text=` |
+| Every listed company | `ListofScripData_new/w?segment=Equity&status=Active` |
 
 Quarters are addressed by BSE's `qtrid`. It advances by exactly one per calendar
 quarter from a verified anchor (June 2023 = `118.00`), which is how the sidebar
@@ -73,5 +79,21 @@ dropdown is built.
   the public statement with `PARTIAL` status.
 - Requests are throttled (0.35 s default, adjustable) with automatic retries on
   429/5xx. Please keep the pause in place for large lists.
+- Scraping runs across a thread pool, one `requests.Session` per worker.
+  Sessions aren't thread-safe, so they're thread-local.
+- BSE's equity segment also lists ~260 ETFs and mutual-fund schemes. The
+  exclusion checkbox drops them by name; it is deliberately conservative, so
+  real companies such as *SBI Funds Management Ltd* are kept.
+- Interrupting a run (Streamlit's **Stop**) closes the CSVs cleanly — whatever
+  was scraped stays on disk and remains downloadable.
 - `bse_shp.py` has no Streamlit dependency, so it can be imported and used for
-  batch jobs on its own.
+  batch jobs on its own:
+
+  ```python
+  import bse_shp as b
+  s = b.make_session()
+  q = b.quarter_choices()[0]                     # latest filed quarter
+  universe = b.filter_universe(b.list_all_companies(s), exclude_funds=True)
+  for res in b.scrape_many(universe, q["label"], q["qtrid"], workers=8):
+      ...                                        # CompanyResult per company
+  ```
