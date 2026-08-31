@@ -101,12 +101,67 @@ def make_session() -> requests.Session:
     return s
 
 
+class BSERefused(RuntimeError):
+    """BSE answered, but not with data.
+
+    A refused request is bounced to /error_Bse.html. Chasing that redirect
+    loops ~30 times before failing, so redirects are disabled and the bounce is
+    reported as what it is. The usual cause on a hosted deployment is BSE
+    blocking the server's IP.
+    """
+
+
 def _get_json(session, path, params, timeout=30):
-    r = session.get(f"{API}/{path}", params=params, timeout=timeout)
+    r = session.get(f"{API}/{path}", params=params, timeout=timeout,
+                    allow_redirects=False)
+    if r.is_redirect or r.is_permanent_redirect:
+        raise BSERefused(
+            f"BSE bounced the request to {r.headers.get('location', '?')} "
+            f"(HTTP {r.status_code}). On cloud hosting this usually means BSE "
+            f"is blocking the server's IP address.")
+    if r.status_code in (401, 403, 429):
+        raise BSERefused(
+            f"BSE returned HTTP {r.status_code} — the request was rejected"
+            + (" (rate limited; lower the worker count)"
+               if r.status_code == 429 else
+               " (IP or headers refused)"))
     r.raise_for_status()
-    if not r.text.strip():
+    body = r.text.strip()
+    if not body:
         return {}
+    ctype = (r.headers.get("content-type") or "").lower()
+    if not body.startswith(("[", "{")) or "html" in ctype:
+        raise BSERefused(
+            f"BSE returned {ctype or 'non-JSON'} instead of data "
+            f"({body[:80]!r})")
     return r.json()
+
+
+def check_connection(session: requests.Session) -> dict:
+    """Can we actually reach BSE from here? Used by the app's diagnostics."""
+    out = {"website": None, "api": None, "ok": False, "detail": ""}
+    try:
+        r = session.get("https://www.bseindia.com/", timeout=20,
+                        allow_redirects=False)
+        out["website"] = r.status_code
+    except requests.RequestException as exc:
+        out["detail"] = f"cannot reach bseindia.com: {exc}"
+        return out
+    try:
+        d = _get_json(session, "Corp_shpSec_shpqtrinfo_ng/w",
+                      {"scripcode": 500325, "qtrcode": quarter_id("June", 2023)})
+        out["api"] = 200
+        rows = d.get("table1") or d.get("Table1") or []
+        out["ok"] = bool(rows)
+        out["detail"] = ("BSE is reachable and returning data."
+                         if rows else "API answered but sent no rows.")
+    except BSERefused as exc:
+        out["detail"] = str(exc)
+    except requests.RequestException as exc:
+        out["detail"] = f"API unreachable: {exc}"
+    except ValueError as exc:
+        out["detail"] = f"API sent unparseable data: {exc}"
+    return out
 
 
 # ------------------------------------------------------------------- lookup ---
@@ -119,7 +174,11 @@ def search_company(session: requests.Session, text: str) -> list[dict]:
     if not text:
         return []
     r = session.get(f"{API}/PeerSmartSearch/w",
-                    params={"Type": "SS", "text": text}, timeout=25)
+                    params={"Type": "SS", "text": text}, timeout=25,
+                    allow_redirects=False)
+    if r.is_redirect:
+        raise BSERefused("BSE bounced the company search — server IP likely "
+                         "blocked.")
     r.raise_for_status()
     seen, out = set(), []
     for code, name in _LICLICK.findall(r.text):
@@ -286,6 +345,11 @@ def scrape_company(session, token_or_resolved, quarter_label, qtrid,
     else:
         try:
             info = resolve_company(session, token_or_resolved)
+        except BSERefused as exc:
+            return CompanyResult(scripcode="", name=str(token_or_resolved),
+                                 quarter=quarter_label, qtrid=qtrid,
+                                 status="BLOCKED", message=str(exc),
+                                 input_token=str(token_or_resolved))
         except (LookupError, ValueError) as exc:
             return CompanyResult(scripcode="", name=str(token_or_resolved),
                                  quarter=quarter_label, qtrid=qtrid,
@@ -322,6 +386,9 @@ def scrape_company(session, token_or_resolved, quarter_label, qtrid,
         elif not res.foreign_rows:
             res.status = "PARTIAL"
             res.message = "foreign ownership limits not disclosed"
+    except BSERefused as exc:
+        res.status = "BLOCKED"
+        res.message = str(exc)
     except requests.RequestException as exc:
         res.status = "ERROR"
         res.message = f"network: {exc}"
@@ -510,6 +577,32 @@ SUMMARY_HEADER = ["Scrip Code", "Company", "Quarter", "Total Public Shares Held"
                   "Foreign Ownership Rows", "Status", "Note"]
 
 
+def pick_run_dir(preferred: str | None = None) -> str:
+    """A directory we can actually write to.
+
+    Streamlit Cloud mounts the repo read-only, so writing `./runs` next to the
+    app raises PermissionError and kills the run before it starts. Fall back to
+    the system temp directory.
+    """
+    import tempfile
+
+    candidates = [preferred] if preferred else []
+    candidates.append(os.path.join(tempfile.gettempdir(), "bse_shp_runs"))
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            os.makedirs(cand, exist_ok=True)
+            probe = os.path.join(cand, ".write_test")
+            with open(probe, "w") as fh:
+                fh.write("ok")
+            os.remove(probe)
+            return cand
+        except OSError:
+            continue
+    return tempfile.mkdtemp(prefix="bse_shp_")
+
+
 class RunWriter:
     """Streams scraped rows straight to CSV.
 
@@ -620,6 +713,26 @@ class RunWriter:
                 if os.path.exists(self.paths[name]):
                     z.write(self.paths[name], f"{label}.csv")
         return buf.getvalue()
+
+    CSV_LABELS = {"public": "Public Shareholding", "foreign": "Foreign Ownership Limits",
+                  "summary": "Summary", "log": "Run Log"}
+
+    def csv_bytes(self, name: str) -> bytes:
+        """One table, exactly as written, as a plain CSV download."""
+        self.flush()
+        path = self.paths[name]
+        if not os.path.exists(path):
+            return b""
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def csv_size(self, name: str) -> int:
+        path = self.paths.get(name)
+        return os.path.getsize(path) if path and os.path.exists(path) else 0
+
+    def row_count(self, name: str) -> int:
+        return {"public": self.public_rows, "foreign": self.foreign_rows,
+                "summary": self.companies, "log": self.companies}.get(name, 0)
 
     def excel_bytes(self, max_rows: int = 400_000) -> bytes:
         """Multi-sheet .xlsx read back off the CSVs."""

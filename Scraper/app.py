@@ -20,7 +20,9 @@ st.set_page_config(page_title="BSE Shareholding Pattern Scraper",
                    page_icon="📊", layout="wide")
 
 SAMPLE = "Reliance Industries\nTata Consultancy Services\nHDFC Bank\nInfosys"
-RUNS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+# Streamlit Cloud mounts the repo read-only, so fall back to a temp dir.
+RUNS_DIR = bse.pick_run_dir(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs"))
 ALL_MODE = "🌐 All BSE listed companies"
 MANUAL_MODE = "✍️ Pick companies manually"
 
@@ -28,7 +30,8 @@ MANUAL_MODE = "✍️ Pick companies manually"
 # ------------------------------------------------------------------- state ----
 for key, val in {"writer": None, "running": False, "done": False,
                  "quarter": "", "elapsed": 0.0, "last": None,
-                 "interrupted": False}.items():
+                 "interrupted": False, "xlsx": None, "zipb": None,
+                 "conn": None}.items():
     st.session_state.setdefault(key, val)
 
 
@@ -37,7 +40,7 @@ def reset_run():
     if w is not None:
         w.close()
     st.session_state.update(writer=None, done=False, elapsed=0.0, last=None,
-                            interrupted=False)
+                            interrupted=False, xlsx=None, zipb=None)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -169,6 +172,17 @@ if st.sidebar.button("🧹 Clear results", use_container_width=True):
     reset_run()
     st.rerun()
 
+with st.sidebar.expander("🩺 Connection check"):
+    st.caption("If scraping fails everywhere, start here. Hosted deployments "
+               "are often blocked by BSE at the IP level.")
+    if st.button("Test BSE connection", use_container_width=True):
+        with st.spinner("Talking to BSE…"):
+            st.session_state.conn = bse.check_connection(bse.make_session())
+    c = st.session_state.conn
+    if c:
+        st.write(f"bseindia.com: `{c['website']}` · API: `{c['api']}`")
+        (st.success if c["ok"] else st.error)(c["detail"])
+
 # -------------------------------------------------------------------- header --
 st.title("BSE Shareholding Pattern Scraper")
 st.markdown(
@@ -216,7 +230,7 @@ def paint_kpis(done_n, total_n):
         c[2].metric("Partial / none",
                     f"{sc.get('PARTIAL', 0) + sc.get('NO DATA', 0):,}")
         c[3].metric("Failed",
-                    f"{sc.get('ERROR', 0) + sc.get('NOT FOUND', 0):,}")
+                    f"{sc.get('ERROR', 0) + sc.get('NOT FOUND', 0) + sc.get('BLOCKED', 0):,}")
         c[4].metric("Public rows", f"{(w.public_rows if w else 0):,}")
         c[5].metric("Foreign rows", f"{(w.foreign_rows if w else 0):,}")
 
@@ -270,30 +284,60 @@ def paint_download():
     w = st.session_state.writer
     if not w or (w.public_rows == 0 and w.foreign_rows == 0):
         return
-    stamp = st.session_state.quarter.replace(" ", "_")
-    big = w.public_rows > 250_000
+    stamp = f"{st.session_state.quarter.replace(' ', '_')}_{datetime.now():%Y%m%d_%H%M}"
     with dl_slot.container():
         st.divider()
+        st.markdown("#### ⬇️ Export")
+
+        st.caption("**CSV — one file per table.** Written straight from disk, so "
+                   "these work at any size.")
+        cols = st.columns(4)
+        for col, key in zip(cols, ("public", "foreign", "summary", "log")):
+            label = w.CSV_LABELS[key]
+            rows, size = w.row_count(key), w.csv_size(key)
+            col.download_button(
+                f"{label}  \n`{rows:,} rows · {size / 1_048_576:.1f} MB`",
+                data=w.csv_bytes(key),
+                file_name=f"BSE_{label.replace(' ', '_')}_{stamp}.csv",
+                mime="text/csv", use_container_width=True,
+                disabled=size == 0, key=f"csv_{key}")
+
+        st.caption("**Everything in one file.** Built on demand — a full-universe "
+                   "run is large, so it is not rebuilt on every click.")
         c1, c2, c3 = st.columns([1, 1, 2])
-        if big:
-            c1.caption("⚠️ Over 250k rows — the CSV bundle is the safer export.")
+
+        big = w.public_rows > 250_000
+        if st.session_state.xlsx is None:
+            c1.button("🧮 Build Excel workbook", use_container_width=True,
+                      disabled=big, key="mk_xlsx",
+                      help="All five sheets in one .xlsx."
+                           + (" Disabled above 250k rows — use the CSVs."
+                              if big else ""),
+                      on_click=lambda: st.session_state.update(
+                          xlsx=w.excel_bytes()))
         else:
             c1.download_button(
-                "⬇️ Export to Excel", data=w.excel_bytes(),
-                file_name=f"BSE_Shareholding_{stamp}_"
-                          f"{datetime.now():%Y%m%d_%H%M}.xlsx",
+                "⬇️ Download Excel", data=st.session_state.xlsx,
+                file_name=f"BSE_Shareholding_{stamp}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument."
                      "spreadsheetml.sheet",
-                type="primary", use_container_width=True)
-        c2.download_button(
-            "⬇️ Export CSV bundle (.zip)", data=w.zip_bytes(),
-            file_name=f"BSE_Shareholding_{stamp}_"
-                      f"{datetime.now():%Y%m%d_%H%M}.zip",
-            mime="application/zip",
-            type="primary" if big else "secondary", use_container_width=True)
-        c3.caption("Sheets: **About**, **Summary**, **Public Shareholding**, "
-                   "**Foreign Ownership Limits**, **Run Log**.  \n"
-                   f"Raw CSVs also on disk at `{w.dir}`")
+                type="primary", use_container_width=True, key="dl_xlsx")
+
+        if st.session_state.zipb is None:
+            c2.button("🗜️ Build CSV bundle", use_container_width=True,
+                      key="mk_zip", help="All tables zipped together.",
+                      on_click=lambda: st.session_state.update(
+                          zipb=w.zip_bytes()))
+        else:
+            c2.download_button(
+                "⬇️ Download .zip", data=st.session_state.zipb,
+                file_name=f"BSE_Shareholding_{stamp}.zip", mime="application/zip",
+                type="primary", use_container_width=True, key="dl_zip")
+
+        c3.caption(f"Raw CSVs are already on disk at  \n`{w.dir}`")
+        if big:
+            c3.caption("⚠️ Over 250k rows — Excel is impractical at this size; "
+                       "use the CSVs.")
 
 
 # ---------------------------------------------------------------- the scrape --
@@ -318,7 +362,8 @@ if start:
             st.session_state.last = res
 
             icon = {"OK": "✅", "PARTIAL": "⚠️", "NO DATA": "➖",
-                    "NOT FOUND": "❓", "ERROR": "❌"}.get(res.status, "•")
+                    "NOT FOUND": "❓", "ERROR": "❌",
+                    "BLOCKED": "🚫"}.get(res.status, "•")
             rate = done / max(time.time() - t0, 0.001)
             left = (n_targets - done) / rate if rate else 0
             bar.progress(done / n_targets,
@@ -349,6 +394,17 @@ if start:
     paint_last(st.session_state.last)
     bar.progress(1.0, text=f"Finished {done:,} companies in "
                            f"{st.session_state.elapsed / 60:.1f} min")
+
+    blocked = writer.status_counts.get("BLOCKED", 0)
+    if blocked and blocked >= max(done * 0.5, 1):
+        st.error(
+            f"🚫 BSE refused {blocked:,} of {done:,} requests. This host's IP "
+            f"is almost certainly blocked — the same code works from a normal "
+            f"machine. Run it locally with `streamlit run app.py`, or deploy "
+            f"somewhere with an Indian egress IP.")
+    elif writer.status_counts.get("ERROR"):
+        st.warning(f"{writer.status_counts['ERROR']:,} companies failed on "
+                   f"network errors — see the Run Log tab for the reasons.")
     paint_download()
 
 elif st.session_state.done and st.session_state.writer is not None:
